@@ -848,6 +848,35 @@ class MagenticPlanReviewRequest:
         return MagenticPlanReviewResponse.revise(feedback)
 
 
+@dataclass
+class MagenticClarificationRequest:
+    """Human-in-the-loop request for clarification during workflow execution.
+
+    Triggered when the orchestrator determines it needs user input to proceed,
+    such as when agents return ambiguous results or multiple matches.
+
+    Attributes:
+        question: The clarification question to ask the user.
+        context: Additional context about why clarification is needed.
+        agent_response: The last agent response that triggered this request.
+    """
+
+    question: str = ""
+    context: str = ""
+    agent_response: str = ""
+
+
+@dataclass
+class MagenticClarificationReply:
+    """Human reply to a clarification request.
+
+    Attributes:
+        answer: The user's answer to the clarification question.
+    """
+
+    answer: str
+
+
 # endregion Human Intervention Types
 
 
@@ -1019,6 +1048,39 @@ class MagenticOrchestrator(BaseGroupChatOrchestrator):
         # in the review process.
         await self._send_plan_review_request(cast(WorkflowContext, ctx), is_stalled=original_request.is_stalled)
 
+    @response_handler
+    async def handle_clarification_response(
+        self,
+        original_request: MagenticClarificationRequest,
+        response: MagenticClarificationReply,
+        ctx: WorkflowContext[GroupChatWorkflowContext_T_Out, list[ChatMessage]],
+    ) -> None:
+        """Handle user's response to a clarification request.
+
+        Adds the user's answer to the chat history and resumes the inner loop.
+        """
+        if self._magentic_context is None:
+            raise RuntimeError("Context not initialized")
+
+        logger.info("Magentic Orchestrator: Received clarification response, resuming")
+
+        # Add the clarification Q&A to chat history so the manager has context
+        question_msg = ChatMessage(
+            role=Role.ASSISTANT,
+            text=f"I need clarification: {original_request.question}",
+            author_name=MAGENTIC_MANAGER_NAME,
+        )
+        self._magentic_context.chat_history.append(question_msg)
+
+        answer_msg = ChatMessage(
+            role=Role.USER,
+            text=f"User clarification: {response.answer}",
+        )
+        self._magentic_context.chat_history.append(answer_msg)
+
+        # Resume the inner loop with the new context
+        await self._run_inner_loop(ctx)
+
     async def _send_plan_review_request(self, ctx: WorkflowContext, is_stalled: bool = False) -> None:
         """Send a human intervention request for plan review.
 
@@ -1034,6 +1096,33 @@ class MagenticOrchestrator(BaseGroupChatOrchestrator):
                 is_stalled=is_stalled,
             ),
             MagenticPlanReviewResponse,
+        )
+
+    async def _send_clarification_request(
+        self,
+        ctx: WorkflowContext,
+        question: str,
+        context: str = "",
+    ) -> None:
+        """Send a clarification request to the user.
+
+        Called when the orchestrator determines it needs user input to proceed,
+        such as when agents return ambiguous results or multiple matches.
+
+        The response will be handled in the response handler `handle_clarification_response`.
+        """
+        last_response = ""
+        if self._magentic_context and self._magentic_context.chat_history:
+            last_msg = self._magentic_context.chat_history[-1]
+            last_response = last_msg.text or ""
+
+        await ctx.request_info(
+            MagenticClarificationRequest(
+                question=question,
+                context=context,
+                agent_response=last_response,
+            ),
+            MagenticClarificationReply,
         )
 
     async def _run_inner_loop(
@@ -1110,6 +1199,16 @@ class MagenticOrchestrator(BaseGroupChatOrchestrator):
             logger.warning("Next speaker answer was not a string; selecting first participant as fallback")
             next_speaker = next(iter(self._participant_registry.participants.keys()))
         instruction = self._progress_ledger.instruction_or_question.answer
+
+        # Check if clarification from user is needed (mid-execution HITL)
+        if next_speaker.lower() == "user":
+            logger.info("Magentic Orchestrator: Clarification needed from user")
+            await self._send_clarification_request(
+                ctx,
+                question=str(instruction),
+                context=self._progress_ledger.next_speaker.reason,
+            )
+            return
 
         if next_speaker not in self._participant_registry.participants:
             logger.warning(f"Invalid next speaker: {next_speaker}")
