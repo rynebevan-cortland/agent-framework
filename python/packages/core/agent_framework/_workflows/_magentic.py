@@ -478,8 +478,13 @@ class MagenticManagerBase(ABC):
         self.task_ledger_full_prompt: str = ORCHESTRATOR_TASK_LEDGER_FULL_PROMPT
 
     @abstractmethod
-    async def plan(self, magentic_context: MagenticContext) -> ChatMessage:
-        """Create a plan for the task."""
+    async def plan(self, magentic_context: MagenticContext) -> ChatMessage | PlanClarificationNeeded:
+        """Create a plan for the task.
+
+        Returns:
+            ChatMessage with the plan, or PlanClarificationNeeded if the facts
+            extraction LLM detected ambiguity and wants to ask the user a question.
+        """
         ...
 
     @abstractmethod
@@ -601,18 +606,62 @@ class StandardMagenticManager(MagenticManagerBase):
 
         return response.messages[-1]
 
-    async def plan(self, magentic_context: MagenticContext) -> ChatMessage:
-        """Create facts and plan using the model, then render a combined task ledger as a single assistant message."""
+    async def plan(self, magentic_context: MagenticContext) -> ChatMessage | PlanClarificationNeeded:
+        """Create facts and plan using the model, then render a combined task ledger as a single assistant message.
+
+        If the facts extraction LLM detects ambiguity and outputs a CLARIFICATION_NEEDED marker,
+        returns a PlanClarificationNeeded signal instead of proceeding to plan creation.
+        """
         team_text = _team_block(magentic_context.participant_descriptions)
 
-        # Gather facts
+        # Step 1: Gather facts (may detect ambiguity)
         facts_user = ChatMessage(
             role=Role.USER,
             text=self.task_ledger_facts_prompt.format(task=magentic_context.task),
         )
         facts_msg = await self._complete([*magentic_context.chat_history, facts_user])
 
-        # Create plan
+        # Check: did the LLM ask for clarification instead of producing facts?
+        if facts_msg.text and "CLARIFICATION_NEEDED:" in facts_msg.text:
+            question = facts_msg.text.split("CLARIFICATION_NEEDED:", 1)[1].strip()
+            return PlanClarificationNeeded(question=question)
+
+        # Step 2-3: Normal plan creation (unchanged)
+        return await self._create_plan_from_facts(magentic_context, team_text, facts_user, facts_msg)
+
+    async def plan_without_clarification(self, magentic_context: MagenticContext) -> ChatMessage:
+        """Create a plan without the clarification option — forces facts production.
+
+        Used as a fallback when the max number of pre-plan clarifications has been reached.
+        Strips any CLARIFICATION_NEEDED marker from the facts prompt before calling the LLM.
+        """
+        team_text = _team_block(magentic_context.participant_descriptions)
+
+        # Use facts prompt but strip the CLARIFICATION_NEEDED instruction block
+        facts_prompt_text = self.task_ledger_facts_prompt.format(task=magentic_context.task)
+        # Remove the CLARIFICATION_NEEDED block (everything between "IMPORTANT" and "If the request is clear")
+        facts_prompt_text = re.sub(
+            r"IMPORTANT\s*[—–-]\s*AMBIGUITY CHECK:.*?If the request is clear enough, proceed with the analysis:\n*",
+            "",
+            facts_prompt_text,
+            flags=_re.DOTALL,
+        )
+
+        facts_user = ChatMessage(role=Role.USER, text=facts_prompt_text)
+        facts_msg = await self._complete([*magentic_context.chat_history, facts_user])
+
+        # If the LLM still outputs CLARIFICATION_NEEDED despite the stripped prompt, ignore it
+        # and use whatever text it produced as facts
+        return await self._create_plan_from_facts(magentic_context, team_text, facts_user, facts_msg)
+
+    async def _create_plan_from_facts(
+        self,
+        magentic_context: MagenticContext,
+        team_text: str,
+        facts_user: ChatMessage,
+        facts_msg: ChatMessage,
+    ) -> ChatMessage:
+        """Shared helper: given extracted facts, create the plan and return the combined task ledger message."""
         plan_user = ChatMessage(
             role=Role.USER,
             text=self.task_ledger_plan_prompt.format(team=team_text),
@@ -623,7 +672,6 @@ class StandardMagenticManager(MagenticManagerBase):
         self.task_ledger = _MagenticTaskLedger(facts=facts_msg, plan=plan_msg)
 
         # Also store individual messages in chat_history for better grounding
-        # This gives the progress ledger model access to the detailed reasoning
         magentic_context.chat_history.extend([facts_user, facts_msg, plan_user, plan_msg])
 
         combined = self.task_ledger_full_prompt.format(
@@ -877,7 +925,45 @@ class MagenticClarificationReply:
     answer: str
 
 
+@dataclass
+class MagenticPlanClarificationRequest:
+    """Pre-plan clarification request — emitted when plan() detects ambiguity in facts extraction.
+
+    Distinct from MagenticClarificationRequest so @response_handler routes to the correct handler
+    (resume *planning* vs resume *execution*).
+
+    Attributes:
+        question: The clarification question to ask the user.
+        context: Additional context (always "pre_plan").
+    """
+
+    question: str = ""
+    context: str = ""
+
+
+@dataclass
+class MagenticPlanClarificationReply:
+    """User's answer to a pre-plan clarification question.
+
+    Attributes:
+        answer: The user's answer to the clarification question.
+    """
+
+    answer: str
+
+
+@dataclass
+class PlanClarificationNeeded:
+    """Returned by plan() when facts extraction detects the request is ambiguous."""
+
+    question: str
+
+
 # endregion Human Intervention Types
+
+
+# Maximum number of pre-plan clarification rounds before forcing plan creation
+MAX_PLAN_CLARIFICATIONS = 3
 
 
 class MagenticOrchestrator(BaseGroupChatOrchestrator):
@@ -924,6 +1010,9 @@ class MagenticOrchestrator(BaseGroupChatOrchestrator):
         self._task_ledger: ChatMessage | None = None
         self._progress_ledger: MagenticProgressLedger | None = None
 
+        # Pre-plan clarification state
+        self._plan_clarification_count: int = 0
+
         # Termination related state
         self._terminated: bool = False
         self._max_rounds = manager.max_round_count
@@ -957,7 +1046,21 @@ class MagenticOrchestrator(BaseGroupChatOrchestrator):
         )
 
         # Initial planning using the manager with real model calls
-        self._task_ledger = await self._manager.plan(self._magentic_context.clone(deep=True))
+        result = await self._manager.plan(self._magentic_context.clone(deep=True))
+
+        # Check if plan() needs pre-plan clarification (only when plan review is enabled)
+        if isinstance(result, PlanClarificationNeeded) and self._require_plan_signoff:
+            self._plan_clarification_count += 1
+            await self._send_plan_clarification_request(cast(WorkflowContext, ctx), result.question)
+            return
+
+        # If clarification was signaled but plan review is off, skip it —
+        # mid-execution clarification will handle ambiguity instead.
+        if isinstance(result, PlanClarificationNeeded):
+            logger.info("Plan clarification needed but plan review is off; proceeding without clarification")
+            result = await self._manager.plan_without_clarification(self._magentic_context.clone(deep=True))
+
+        self._task_ledger = result
         await ctx.add_event(
             MagenticOrchestratorEvent(
                 executor_id=self.id,
@@ -1078,6 +1181,14 @@ class MagenticOrchestrator(BaseGroupChatOrchestrator):
         )
         self._magentic_context.chat_history.append(answer_msg)
 
+        # Update the task to include the user's clarification answer so that
+        # {task} in the progress ledger and final answer prompts reflects
+        # the user's latest input (which may contain a new request).
+        self._magentic_context.task = (
+            f"{self._magentic_context.task}\n\n"
+            f"User clarification: {response.answer}"
+        )
+
         # Resume the inner loop with the new context
         await self._run_inner_loop(ctx)
 
@@ -1124,6 +1235,88 @@ class MagenticOrchestrator(BaseGroupChatOrchestrator):
             ),
             MagenticClarificationReply,
         )
+
+    async def _send_plan_clarification_request(
+        self,
+        ctx: WorkflowContext,
+        question: str,
+    ) -> None:
+        """Send a pre-plan clarification request to the user.
+
+        Called when plan() detects ambiguity during facts extraction.
+        The response will be handled in `handle_plan_clarification_response`.
+        """
+        await ctx.request_info(
+            MagenticPlanClarificationRequest(question=question, context="pre_plan"),
+            MagenticPlanClarificationReply,
+        )
+
+    @response_handler
+    async def handle_plan_clarification_response(
+        self,
+        original_request: MagenticPlanClarificationRequest,
+        response: MagenticPlanClarificationReply,
+        ctx: WorkflowContext[GroupChatWorkflowContext_T_Out, list[ChatMessage]],
+    ) -> None:
+        """Handle user's response to a pre-plan clarification question.
+
+        After each answer, calls plan() again. If plan() detects another ambiguity,
+        asks another question (up to MAX_PLAN_CLARIFICATIONS). If plan() succeeds,
+        proceeds to plan review.
+        """
+        if self._magentic_context is None:
+            raise RuntimeError("Context not initialized")
+
+        logger.info("Magentic Orchestrator: Received pre-plan clarification response")
+
+        # Add Q&A to chat history
+        q_msg = ChatMessage(
+            role=Role.ASSISTANT,
+            text=f"I need clarification: {original_request.question}",
+            author_name=MAGENTIC_MANAGER_NAME,
+        )
+        a_msg = ChatMessage(
+            role=Role.USER,
+            text=f"User clarification: {response.answer}",
+        )
+        self._magentic_context.chat_history.extend([q_msg, a_msg])
+
+        # Enrich the task with the user's answer
+        self._magentic_context.task += f"\n\nUser clarification: {response.answer}"
+
+        # Run plan() again with enriched context
+        result = await self._manager.plan(self._magentic_context.clone(deep=True))
+
+        # Check if plan() found another ambiguity
+        if isinstance(result, PlanClarificationNeeded):
+            if self._plan_clarification_count < MAX_PLAN_CLARIFICATIONS:
+                self._plan_clarification_count += 1
+                await self._send_plan_clarification_request(cast(WorkflowContext, ctx), result.question)
+                return
+            # Max reached — force plan creation without clarification option
+            logger.info(
+                f"Max pre-plan clarifications ({MAX_PLAN_CLARIFICATIONS}) reached, forcing plan creation"
+            )
+            result = await self._manager.plan_without_clarification(self._magentic_context.clone(deep=True))
+
+        # Plan created successfully
+        self._task_ledger = result
+        await ctx.add_event(
+            MagenticOrchestratorEvent(
+                executor_id=self.id,
+                event_type=MagenticOrchestratorEventType.PLAN_CREATED,
+                data=self._task_ledger,
+            )
+        )
+
+        # Send for plan review (we are always in plan review mode when pre-plan clarification fires)
+        if self._require_plan_signoff:
+            await self._send_plan_review_request(cast(WorkflowContext, ctx))
+            return
+
+        # Fallback: if plan review was somehow disabled, proceed directly
+        self._magentic_context.chat_history.append(self._task_ledger)
+        await self._run_inner_loop(ctx)
 
     async def _run_inner_loop(
         self,
